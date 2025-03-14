@@ -2,7 +2,7 @@ package main
 
 import (
 	"context"
-	"log"
+	"fmt"
 	"os"
 	"os/signal"
 	"syscall"
@@ -13,82 +13,78 @@ import (
 )
 
 func main() {
-	// Create context with cancellation
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
 	// Create processor
-	p := processor.NewProcessor(ctx)
-
-	// Start the system
-	if err := p.Start(); err != nil {
-		log.Fatalf("Failed to start system: %v", err)
+	proc, err := processor.NewProcessor(ctx)
+	if err != nil {
+		fmt.Printf("Error creating processor: %v\n", err)
+		os.Exit(1)
 	}
 
-	// Get initial system status
-	status := p.GetStatus()
-	log.Printf("System started in %s mode", status.Mode)
-
-	// Get robot anatomy information
-	anatomy := p.GetAnatomy()
-	log.Printf("Robot total weight: %.2f kg", anatomy.CalculateTotalWeight())
-	
-	// Get critical parts
-	criticalParts := anatomy.GetCriticalParts()
-	log.Printf("Critical parts: %d", len(criticalParts))
-	for _, part := range criticalParts {
-		log.Printf("- %s (Health: %.2f%%)", part.Name, part.GetHealth())
+	// Start the processor
+	if err := proc.Start(); err != nil {
+		fmt.Printf("Error starting processor: %v\n", err)
+		os.Exit(1)
 	}
 
-	// Simulate a threat
-	threat := common.Threat{
-		ID:        "THREAT-001",
-		Type:      "physical",
-		Location:  common.Location{X: 100, Y: 100, Z: 0}, // Place threat further away to see movement
-		Severity:  8, // Increase severity to ensure proactive engagement
-		Timestamp: time.Now().Unix(),
-		Description: "High-priority hostile target detected",
-	}
-
-	// Report the threat
-	if err := p.ReportThreat(threat); err != nil {
-		log.Fatalf("Failed to report threat: %v", err)
-	}
-
-	// Monitor system and wait for threat elimination
-	threatEliminated := make(chan bool)
-	go func() {
-		for {
-			status := p.GetStatus()
-			if status.Mode == common.Normal && p.GetActiveThreat() == nil {
-				threatEliminated <- true
-				return
-			}
-			time.Sleep(100 * time.Millisecond)
-		}
-	}()
-
-	// Handle shutdown signals
+	// Set up signal handling for graceful shutdown
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
 
-	// Wait for either threat elimination or shutdown signal
+	// Channel to signal when threats are eliminated
+	threatsEliminated := make(chan struct{})
+
+	// Create a test threat
+	threat := common.Threat{
+		ID:          "THREAT-001",
+		Severity:    8,
+		Location:    common.Location{X: 100, Y: 100, Z: 0},
+		Health:      100.0, // Initial health at 100%
+		Type:        "hostile_robot",
+		Description: "Hostile combat robot detected",
+		Timestamp:   time.Now().Unix(),
+	}
+
+	// Report the threat
+	if err := proc.ReportThreat(threat); err != nil {
+		fmt.Printf("Error reporting threat: %v\n", err)
+	}
+
+	// Monitor threat health
+	go func() {
+		ticker := time.NewTicker(1 * time.Second)
+		defer ticker.Stop()
+
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				if activeThreat := proc.GetActiveThreat(); activeThreat != nil {
+					fmt.Printf("Threat %s Health: %.2f%%\n", activeThreat.ID, activeThreat.Health)
+				} else {
+					// If no active threat, signal elimination and stop monitoring
+					close(threatsEliminated)
+					return
+				}
+			}
+		}
+	}()
+
+	// Wait for either a signal, timeout, or all threats to be eliminated
 	select {
 	case <-sigChan:
-		log.Println("Received shutdown signal")
-	case <-threatEliminated:
-		log.Println("All threats eliminated")
+		fmt.Println("\nReceived shutdown signal")
+	case <-time.After(30 * time.Second):
+		fmt.Println("\nTimeout reached")
+	case <-threatsEliminated:
+		fmt.Println("\nAll threats have been eliminated")
 	}
 
-	// Get final health status
-	healthStatus := anatomy.GetHealthStatus()
-	log.Println("Final health status:")
-	for part, health := range healthStatus {
-		log.Printf("- %s: %.2f%%", part, health)
-	}
-
-	// Stop the system
-	if err := p.Stop(); err != nil {
-		log.Printf("Error during shutdown: %v", err)
+	// Stop the processor
+	if err := proc.Stop(); err != nil {
+		fmt.Printf("Error stopping processor: %v\n", err)
 	}
 } 

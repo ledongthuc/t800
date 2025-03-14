@@ -58,6 +58,7 @@ type Threat struct {
 	Severity    int
 	Timestamp   int64
 	Description string
+	Health      float64 // Health percentage (0-100)
 }
 
 // OperationMode defines the current operation mode

@@ -3,12 +3,11 @@ package processor
 import (
 	"context"
 	"fmt"
-	"math"
-	"math/rand"
 	"sync"
 	"time"
 
 	"t800/internal/anatomy"
+	"t800/internal/ai"
 	"t800/internal/common"
 	"t800/internal/defense"
 	"t800/internal/monitoring"
@@ -18,18 +17,21 @@ import (
 
 // Processor represents the main T800 defensive system
 type Processor struct {
-	logger     *monitoring.Logger
-	anatomy    *anatomy.RobotAnatomy
-	defense    *defense.StrategyManager
-	offense    *offense.OffenseManager
-	scanner    *scanner.Scanner
-	status     *Status
-	location   common.Location
-	speed      common.MovementSpeed
-	ctx        context.Context
-	cancel     context.CancelFunc
-	activeThreat *common.Threat
+	logger          *monitoring.Logger
+	anatomy         *anatomy.RobotAnatomy
+	defense         *defense.StrategyManager
+	offense         *offense.OffenseManager
+	scanner         *scanner.Scanner
+	status          *Status
+	location        common.Location
+	speed           common.MovementSpeed
+	ctx             context.Context
+	cancel          context.CancelFunc
+	activeThreat    *common.Threat
 	engagementDistance float64
+	decisionMaker   *ai.DecisionMaker
+	mode            common.OperationMode
+	availableWeapons []string
 }
 
 // Status maintains the processor's current state
@@ -41,21 +43,31 @@ type Status struct {
 }
 
 // NewProcessor creates a new T800 processor
-func NewProcessor(ctx context.Context) *Processor {
+func NewProcessor(ctx context.Context) (*Processor, error) {
 	ctx, cancel := context.WithCancel(ctx)
-	return &Processor{
-		logger:     monitoring.NewLogger(),
-		anatomy:    anatomy.NewRobotAnatomy(),
-		defense:    defense.NewStrategyManager(),
-		offense:    offense.NewOffenseManager(),
-		scanner:    scanner.NewScanner(),
-		status:     &Status{Mode: common.Normal},
-		location:   common.Location{X: 0, Y: 0, Z: 0},
-		speed:      common.DefaultSpeed(),
-		ctx:        ctx,
-		cancel:     cancel,
-		engagementDistance: 20.0, // Optimal engagement distance in meters
+	logger := monitoring.NewLogger()
+	
+	decisionMaker, err := ai.NewDecisionMaker(logger)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create decision maker: %v", err)
 	}
+
+	return &Processor{
+		logger:          logger,
+		anatomy:         anatomy.NewRobotAnatomy(),
+		defense:         defense.NewStrategyManager(),
+		offense:         offense.NewOffenseManager(),
+		scanner:         scanner.NewScanner(),
+		status:          &Status{Mode: common.Normal},
+		location:        common.Location{X: 0, Y: 0, Z: 0},
+		speed:           common.DefaultSpeed(),
+		ctx:             ctx,
+		cancel:          cancel,
+		engagementDistance: 50.0,
+		decisionMaker:   decisionMaker,
+		mode:            common.Normal,
+		availableWeapons: []string{"plasma_cannon", "missile", "emp_pulse", "laser_beam"},
+	}, nil
 }
 
 // Start initializes the defensive system
@@ -207,7 +219,7 @@ func (p *Processor) moveTowardsTarget(target common.Location) {
 	p.logger.Info(fmt.Sprintf("Moving towards target. Distance: %.2f meters", distance))
 }
 
-// scanEnvironment continuously scans the environment and responds to threats
+// scanEnvironment continuously scans for threats and processes them
 func (p *Processor) scanEnvironment() {
 	ticker := time.NewTicker(500 * time.Millisecond)
 	defer ticker.Stop()
@@ -221,191 +233,142 @@ func (p *Processor) scanEnvironment() {
 			return
 		case <-ticker.C:
 			threats := p.scanner.ScanArea(p.location)
-			p.processThreats(threats)
+			if err := p.processThreatsWithAI(p.ctx, threats); err != nil {
+				p.logger.LogError(err, "failed to process threats with AI")
+			}
 		case <-movementTicker.C:
 			if p.activeThreat != nil {
-				p.moveAndEngage()
+				if err := p.moveAndEngageWithAI(p.ctx); err != nil {
+					p.logger.LogError(err, "failed to move and engage with AI")
+				}
 			}
 		}
 	}
 }
 
-// processThreats evaluates and prioritizes threats
-func (p *Processor) processThreats(threats []*common.Threat) {
+// processThreatsWithAI evaluates threats using AI decision maker
+func (p *Processor) processThreatsWithAI(ctx context.Context, threats []*common.Threat) error {
 	if len(threats) == 0 {
-		return
+		if p.activeThreat != nil {
+			p.logger.Info("No threats detected, returning to normal mode")
+			p.mode = common.Normal
+			p.activeThreat = nil
+		}
+		return nil
 	}
-
-	// Find the highest severity threat
-	var highestThreat *common.Threat
-	highestSeverity := -1
 
 	for _, threat := range threats {
-		// Log detected threat
-		p.logger.LogThreat(threat.ID, threat.Severity, threat.Location)
+		// Skip eliminated threats
+		if threat.Health <= 0 {
+			continue
+		}
 
-		if threat.Severity > highestSeverity {
-			highestSeverity = threat.Severity
-			highestThreat = threat
+		shouldEngage, err := p.decisionMaker.ShouldEngageProactively(ctx, *threat, p.location, p.getHealthStatus())
+		if err != nil {
+			return fmt.Errorf("AI decision error: %v", err)
+		}
+
+		if shouldEngage {
+			p.logger.Info("New primary target acquired: " + threat.ID)
+			p.activeThreat = threat
+			p.mode = common.Combat
+			return nil
 		}
 	}
-
-	// Update active threat if we found a more severe one
-	if highestThreat != nil && (p.activeThreat == nil || highestThreat.Severity > p.activeThreat.Severity) {
-		p.activeThreat = highestThreat
-		p.status.mu.Lock()
-		p.status.Mode = common.Combat
-		p.status.mu.Unlock()
-		p.logger.Info(fmt.Sprintf("New primary target acquired: %s (Severity: %d)", highestThreat.ID, highestThreat.Severity))
-	}
+	return nil
 }
 
-// moveAndEngage handles movement and combat with the active threat
-func (p *Processor) moveAndEngage() {
+// moveAndEngageWithAI handles movement and combat using AI decisions
+func (p *Processor) moveAndEngageWithAI(ctx context.Context) error {
 	if p.activeThreat == nil {
+		return nil
+	}
+
+	decision, err := p.decisionMaker.MakeCombatDecision(
+		ctx,
+		p.location,
+		p.activeThreat,
+		p.getHealthStatus(),
+		p.availableWeapons,
+	)
+	if err != nil {
+		return fmt.Errorf("AI decision error: %v", err)
+	}
+
+	switch decision.Action {
+	case "move":
+		p.moveTowardsTarget(p.activeThreat.Location)
+	case "attack":
+		p.executeAttack(decision.Weapon)
+	case "defend":
+		p.activateDefensiveMeasures()
+	case "retreat":
+		p.retreatFromThreat()
+	}
+
+	return nil
+}
+
+// executeAttack executes an attack against the current threat
+func (p *Processor) executeAttack(weapon string) {
+	if p.activeThreat == nil || p.activeThreat.Health <= 0 {
 		return
 	}
 
-	distance := common.CalculateDistance(p.location, p.activeThreat.Location)
-	
-	// If we're at optimal engagement distance, focus on attack
-	if math.Abs(distance - p.engagementDistance) < 1.0 {
-		p.engageTarget(p.activeThreat)
-	} else if distance > p.engagementDistance {
-		// Move to optimal engagement distance
-		targetPos := p.activeThreat.Location
-		p.moveTowardsTarget(targetPos)
-		
-		// Execute preemptive strikes while moving
-		if p.shouldEngageProactively(p.activeThreat) {
-			p.executePreemptiveStrike(p.activeThreat)
-		}
-	} else {
-		// Too close, back up while attacking
-		// Calculate backup position
-		direction := common.Location{
-			X: p.location.X - p.activeThreat.Location.X,
-			Y: p.location.Y - p.activeThreat.Location.Y,
-			Z: p.location.Z - p.activeThreat.Location.Z,
-		}
-		distance := common.CalculateDistance(p.location, p.activeThreat.Location)
-		scale := p.engagementDistance / distance
-		backupPos := common.Location{
-			X: p.activeThreat.Location.X + direction.X * scale,
-			Y: p.activeThreat.Location.Y + direction.Y * scale,
-			Z: p.activeThreat.Location.Z + direction.Z * scale,
-		}
-		p.moveTowardsTarget(backupPos)
-		p.engageTarget(p.activeThreat)
+	// Calculate damage based on weapon type
+	var damage float64
+	switch weapon {
+	case "plasma_cannon":
+		damage = 25.0
+	case "missile":
+		damage = 40.0
+	case "emp_pulse":
+		damage = 15.0
+	case "laser_beam":
+		damage = 20.0
+	default:
+		damage = 10.0
 	}
 
-	// Clear active threat if it's been eliminated
-	// In a real system, this would be based on threat detection updates
-	if rand.Float64() < 0.1 { // 10% chance of eliminating threat each engagement
-		p.logger.Info(fmt.Sprintf("Target %s eliminated", p.activeThreat.ID))
+	// Apply damage to threat
+	p.activeThreat.Health -= damage
+	if p.activeThreat.Health < 0 {
+		p.activeThreat.Health = 0
+	}
+
+	// Log the attack
+	p.logger.Info(fmt.Sprintf("Attacked %s with %s (Damage: %.1f%%, Remaining Health: %.1f%%)",
+		p.activeThreat.ID, weapon, damage, p.activeThreat.Health))
+
+	// If threat is eliminated, clear it
+	if p.activeThreat.Health <= 0 {
+		p.logger.Info(fmt.Sprintf("Threat %s has been eliminated", p.activeThreat.ID))
 		p.activeThreat = nil
-		p.status.mu.Lock()
-		p.status.Mode = common.Normal
-		p.status.mu.Unlock()
+		p.mode = common.Normal
 	}
 }
 
-// shouldEngageProactively determines if the robot should attack proactively
-func (p *Processor) shouldEngageProactively(threat *common.Threat) bool {
-	// Define engagement criteria
-	if threat.Severity >= 6 {
-		// Always engage high-severity threats
-		return true
-	}
-
-	distance := common.CalculateDistance(threat.Location, p.location)
-	if distance < 30.0 && threat.Severity >= 3 {
-		// Engage medium-severity threats within 30 meters
-		return true
-	}
-
-	return false
+// activateDefensiveMeasures activates defensive systems
+func (p *Processor) activateDefensiveMeasures() {
+	p.logger.Info("Activating defensive measures")
+	// Implement defensive measures
 }
 
-// engageTarget initiates offensive actions against a target
-func (p *Processor) engageTarget(threat *common.Threat) {
-	p.logger.LogDefensiveAction("Initiating proactive engagement", "system", true)
-
-	// First, prepare defensive measures
-	criticalParts := p.anatomy.GetCriticalParts()
-	for _, part := range criticalParts {
-		strategies := p.defense.GetDefensiveStrategies(part)
-		for _, strategy := range strategies {
-			if err := strategy.Action(part, threat); err != nil {
-				p.logger.LogError(err, "defensive preparation failed")
-			}
-		}
-	}
-
-	// Launch coordinated attack
-	p.executeCoordinatedAttack(threat)
+// retreatFromThreat moves away from the current threat
+func (p *Processor) retreatFromThreat() {
+	p.logger.Info("Retreating from threat")
+	// Implement retreat logic
 }
 
-// executeCoordinatedAttack performs a coordinated attack using all available weapons
-func (p *Processor) executeCoordinatedAttack(threat *common.Threat) {
-	var wg sync.WaitGroup
-
-	// Use both arms simultaneously for maximum effect
-	for _, arm := range p.anatomy.Arms {
-		attackStrategies := p.offense.GetOffensiveStrategies(arm)
-		for _, strategy := range attackStrategies {
-			wg.Add(1)
-			go func(arm *anatomy.BodyPart, strategy offense.AttackStrategy) {
-				defer wg.Done()
-				if err := strategy.Action(arm, threat); err != nil {
-					p.logger.LogError(err, "arm attack failed")
-				}
-			}(arm, strategy)
-		}
-	}
-
-	// Launch missiles as secondary attack
-	bodyAttacks := p.offense.GetOffensiveStrategies(p.anatomy.Body)
-	for _, strategy := range bodyAttacks {
-		if err := strategy.Action(p.anatomy.Body, threat); err != nil {
-			p.logger.LogError(err, "body attack failed")
-		}
-	}
-
-	// Wait for all arm attacks to complete
-	wg.Wait()
-}
-
-// executePreemptiveStrike launches preemptive attacks against predicted threats
-func (p *Processor) executePreemptiveStrike(threat *common.Threat) {
-	p.logger.LogDefensiveAction("Initiating preemptive strike", "system", true)
-
-	// Use long-range weapons first
-	bodyAttacks := p.offense.GetPreemptiveStrategies(p.anatomy.Body)
-	for _, strategy := range bodyAttacks {
-		if err := strategy.Action(p.anatomy.Body, threat); err != nil {
-			p.logger.LogError(err, "preemptive strike failed")
-		}
-	}
-
-	// Prepare defensive measures while engaging
-	criticalParts := p.anatomy.GetCriticalParts()
-	for _, part := range criticalParts {
-		strategies := p.defense.GetDefensiveStrategies(part)
-		for _, strategy := range strategies {
-			if err := strategy.Action(part, threat); err != nil {
-				p.logger.LogError(err, "defensive preparation failed")
-			}
-		}
-	}
-
-	// Use remaining weapons as backup
-	for _, arm := range p.anatomy.Arms {
-		attackStrategies := p.offense.GetPreemptiveStrategies(arm)
-		for _, strategy := range attackStrategies {
-			if err := strategy.Action(arm, threat); err != nil {
-				p.logger.LogError(err, "arm preemptive strike failed")
-			}
-		}
+// getHealthStatus returns the current health status of all parts
+func (p *Processor) getHealthStatus() map[string]float64 {
+	// Implement health status retrieval
+	return map[string]float64{
+		"head":      100.0,
+		"body":      100.0,
+		"arm_left":  100.0,
+		"arm_right": 100.0,
+		"leg_left":  100.0,
+		"leg_right": 100.0,
 	}
 } 

@@ -1,77 +1,75 @@
 package monitoring
 
 import (
-	"os"
+	"fmt"
 	"time"
 
-	"github.com/sirupsen/logrus"
+	"t800/internal/common"
 )
 
-// Logger provides structured logging for the T800 system
+// Logger handles system logging
 type Logger struct {
-	*logrus.Logger
+	// Add any logger-specific fields here
 }
 
 // NewLogger creates a new logger instance
 func NewLogger() *Logger {
-	logger := &Logger{
-		Logger: logrus.New(),
+	return &Logger{}
+}
+
+// Info logs an informational message
+func (l *Logger) Info(msg string) {
+	fmt.Printf("[%s] INFO: %s\n", time.Now().Format("2006-01-02 15:04:05"), msg)
+}
+
+// LogThreat logs a detected threat
+func (l *Logger) LogThreat(threatID string, severity int, location common.Location) {
+	fmt.Printf("[%s] WARNING: Threat detected - ID: %s, Severity: %d, Location: (%.2f, %.2f, %.2f)\n",
+		time.Now().Format("2006-01-02 15:04:05"),
+		threatID,
+		severity,
+		location.X,
+		location.Y,
+		location.Z)
+}
+
+// LogDefensiveAction logs a defensive action
+func (l *Logger) LogDefensiveAction(action, target string, success bool) {
+	status := "SUCCESS"
+	if !success {
+		status = "FAILED"
 	}
-
-	// Configure logger
-	logger.SetOutput(os.Stdout)
-	logger.SetFormatter(&logrus.JSONFormatter{
-		TimestampFormat: time.RFC3339,
-	})
-
-	return logger
+	fmt.Printf("[%s] INFO: Defensive Action - %s on %s: %s\n",
+		time.Now().Format("2006-01-02 15:04:05"),
+		action,
+		target,
+		status)
 }
 
-// LogThreat logs threat detection events
-func (l *Logger) LogThreat(threatID string, severity int, location interface{}) {
-	l.WithFields(logrus.Fields{
-		"threat_id": threatID,
-		"severity":  severity,
-		"location":  location,
-		"timestamp": time.Now(),
-	}).Warn("Threat detected")
-}
-
-// LogDefensiveAction logs defensive actions taken
-func (l *Logger) LogDefensiveAction(action string, target string, success bool) {
-	l.WithFields(logrus.Fields{
-		"action":    action,
-		"target":    target,
-		"success":   success,
-		"timestamp": time.Now(),
-	}).Info("Defensive action executed")
-}
-
-// LogHealthStatus logs the health status of robot parts
+// LogHealthStatus logs the health status of a part
 func (l *Logger) LogHealthStatus(partName string, health float64, isCritical bool) {
-	l.WithFields(logrus.Fields{
-		"part_name":  partName,
-		"health":     health,
-		"is_critical": isCritical,
-		"timestamp":  time.Now(),
-	}).Info("Health status update")
+	critical := ""
+	if isCritical {
+		critical = " (CRITICAL)"
+	}
+	fmt.Printf("[%s] INFO: Health Status - %s: %.2f%%%s\n",
+		time.Now().Format("2006-01-02 15:04:05"),
+		partName,
+		health,
+		critical)
 }
 
-// LogSystemStatus logs overall system status
-func (l *Logger) LogSystemStatus(mode string, active bool, partsCount int) {
-	l.WithFields(logrus.Fields{
-		"mode":        mode,
-		"active":      active,
-		"parts_count": partsCount,
-		"timestamp":   time.Now(),
-	}).Info("System status update")
+// LogSystemStatus logs the overall system status
+func (l *Logger) LogSystemStatus(status string) {
+	fmt.Printf("[%s] INFO: System Status - %s\n",
+		time.Now().Format("2006-01-02 15:04:05"),
+		status)
 }
 
-// LogError logs error events with context
+// LogError logs an error message
 func (l *Logger) LogError(err error, context string) {
-	l.WithFields(logrus.Fields{
-		"error":     err.Error(),
-		"context":   context,
-		"timestamp": time.Now(),
-	}).Error("System error")
+	fmt.Printf("[%s] ERROR: %s - %v\n",
+		time.Now().Format("2006-01-02 15:04:05"),
+		context,
+		err)
 } 
