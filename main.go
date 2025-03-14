@@ -3,6 +3,9 @@ package main
 import (
 	"context"
 	"log"
+	"os"
+	"os/signal"
+	"syscall"
 	"time"
 
 	"t800/internal/common"
@@ -10,25 +13,24 @@ import (
 )
 
 func main() {
-	// Create context with timeout
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	// Create context with cancellation
+	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	// Create a new T800 processor
-	t800 := processor.NewProcessor(ctx)
+	// Create processor
+	p := processor.NewProcessor(ctx)
 
 	// Start the system
-	if err := t800.Start(); err != nil {
-		log.Fatalf("Failed to start T800: %v", err)
+	if err := p.Start(); err != nil {
+		log.Fatalf("Failed to start system: %v", err)
 	}
-	defer t800.Stop()
 
 	// Get initial system status
-	status := t800.GetStatus()
+	status := p.GetStatus()
 	log.Printf("System started in %s mode", status.Mode)
 
 	// Get robot anatomy information
-	anatomy := t800.GetAnatomy()
+	anatomy := p.GetAnatomy()
 	log.Printf("Robot total weight: %.2f kg", anatomy.CalculateTotalWeight())
 	
 	// Get critical parts
@@ -42,26 +44,51 @@ func main() {
 	threat := common.Threat{
 		ID:        "THREAT-001",
 		Type:      "physical",
-		Location:  common.Location{X: 2, Y: 2, Z: 0},
-		Severity:  3,
+		Location:  common.Location{X: 100, Y: 100, Z: 0}, // Place threat further away to see movement
+		Severity:  8, // Increase severity to ensure proactive engagement
 		Timestamp: time.Now().Unix(),
-		Description: "Potential physical interference detected",
+		Description: "High-priority hostile target detected",
 	}
 
 	// Report the threat
-	if err := t800.ReportThreat(threat); err != nil {
+	if err := p.ReportThreat(threat); err != nil {
 		log.Fatalf("Failed to report threat: %v", err)
 	}
 
-	// Monitor system for a while
-	monitorDuration := 5 * time.Second
-	log.Printf("Monitoring system for %s...", monitorDuration)
-	time.Sleep(monitorDuration)
+	// Monitor system and wait for threat elimination
+	threatEliminated := make(chan bool)
+	go func() {
+		for {
+			status := p.GetStatus()
+			if status.Mode == common.Normal && p.GetActiveThreat() == nil {
+				threatEliminated <- true
+				return
+			}
+			time.Sleep(100 * time.Millisecond)
+		}
+	}()
+
+	// Handle shutdown signals
+	sigChan := make(chan os.Signal, 1)
+	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
+
+	// Wait for either threat elimination or shutdown signal
+	select {
+	case <-sigChan:
+		log.Println("Received shutdown signal")
+	case <-threatEliminated:
+		log.Println("All threats eliminated")
+	}
 
 	// Get final health status
 	healthStatus := anatomy.GetHealthStatus()
 	log.Println("Final health status:")
 	for part, health := range healthStatus {
 		log.Printf("- %s: %.2f%%", part, health)
+	}
+
+	// Stop the system
+	if err := p.Stop(); err != nil {
+		log.Printf("Error during shutdown: %v", err)
 	}
 } 
