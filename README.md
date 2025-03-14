@@ -1,5 +1,7 @@
 # T800 - AI-Powered Combat Robot System
 
+[![asciicast](https://asciinema.org/a/708059.svg)](https://asciinema.org/a/708059)
+
 T800 is an advanced combat robot system that uses AI for decision-making and threat management. The system integrates with Ollama for AI-powered decision making, providing sophisticated combat and defensive capabilities.
 
 ## Quick Start
