@@ -18,6 +18,7 @@ import (
 type DecisionMaker struct {
 	baseURL string
 	logger  *monitoring.Logger
+	model   string
 }
 
 // CombatDecision represents the AI's decision for combat
@@ -30,6 +31,13 @@ type CombatDecision struct {
 	Explanation string  `json:"explanation"`  // Explanation of the decision
 }
 
+// EngagementDecision represents the AI's decision for threat engagement
+type EngagementDecision struct {
+	ShouldEngage bool    `json:"should_engage"`
+	Confidence   float64 `json:"confidence"`
+	Explanation  string  `json:"explanation"`
+}
+
 // NewDecisionMaker creates a new AI decision maker
 func NewDecisionMaker(logger *monitoring.Logger) (*DecisionMaker, error) {
 	baseURL := os.Getenv("OLLAMA_BASE_URL")
@@ -37,10 +45,76 @@ func NewDecisionMaker(logger *monitoring.Logger) (*DecisionMaker, error) {
 		baseURL = "http://localhost:11434"
 	}
 
+	model := os.Getenv("OLLAMA_MODEL")
+	if model == "" {
+		model = "llama3.2" // Default model
+	}
+
 	return &DecisionMaker{
 		baseURL: baseURL,
 		logger:  logger,
+		model:   model,
 	}, nil
+}
+
+// callOllama makes a request to the Ollama API and returns the cleaned response
+func (d *DecisionMaker) callOllama(ctx context.Context, prompt string, result interface{}) error {
+	// Prepare the request body
+	requestBody := map[string]interface{}{
+		"model":  d.model,
+		"prompt": prompt,
+		"stream": false,
+		"format": "json",
+	}
+
+	jsonData, err := json.Marshal(requestBody)
+	if err != nil {
+		return fmt.Errorf("failed to marshal request: %v", err)
+	}
+
+	// Create and send the request
+	req, err := http.NewRequestWithContext(ctx, "POST", d.baseURL+"/api/generate", bytes.NewBuffer(jsonData))
+	if err != nil {
+		return fmt.Errorf("failed to create request: %v", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	client := &http.Client{}
+	resp, err := client.Do(req)
+	if err != nil {
+		return fmt.Errorf("failed to get AI decision: %v", err)
+	}
+	defer resp.Body.Close()
+
+	// Read and parse the response
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return fmt.Errorf("failed to read response: %v", err)
+	}
+
+	var ollamaResponse struct {
+		Response string `json:"response"`
+	}
+	if err := json.Unmarshal(body, &ollamaResponse); err != nil {
+		return fmt.Errorf("failed to parse Ollama response: %v", err)
+	}
+
+	// Clean and parse the response
+	cleanResponse := d.cleanResponse(ollamaResponse.Response)
+	if err := json.Unmarshal([]byte(cleanResponse), result); err != nil {
+		return fmt.Errorf("failed to parse AI decision: %v (response: %s)", err, cleanResponse)
+	}
+
+	return nil
+}
+
+// cleanResponse removes markdown code block markers and trims whitespace
+func (d *DecisionMaker) cleanResponse(response string) string {
+	clean := response
+	clean = strings.TrimPrefix(clean, "```json")
+	clean = strings.TrimPrefix(clean, "```")
+	clean = strings.TrimSuffix(clean, "```")
+	return strings.TrimSpace(clean)
 }
 
 // MakeCombatDecision makes a decision based on current state and threats
@@ -51,7 +125,6 @@ func (d *DecisionMaker) MakeCombatDecision(
 	healthStatus map[string]float64,
 	availableWeapons []string,
 ) (*CombatDecision, error) {
-	// Prepare the context for the AI
 	prompt := fmt.Sprintf(`You are the AI core of a T800 combat robot. Analyze the following situation and make a tactical decision.
 
 Current Location: (%.2f, %.2f, %.2f)
@@ -83,60 +156,9 @@ Do not include any text before or after the JSON object.`,
 		healthStatus,
 		availableWeapons)
 
-	// Prepare the request body for Ollama
-	requestBody := map[string]interface{}{
-		"model": "llama3.2",
-		"prompt": prompt,
-		"stream": false,
-		"format": "json",
-	}
-
-	jsonData, err := json.Marshal(requestBody)
-	if err != nil {
-		return nil, fmt.Errorf("failed to marshal request: %v", err)
-	}
-
-	// Create the request
-	req, err := http.NewRequestWithContext(ctx, "POST", d.baseURL+"/api/generate", bytes.NewBuffer(jsonData))
-	if err != nil {
-		return nil, fmt.Errorf("failed to create request: %v", err)
-	}
-	req.Header.Set("Content-Type", "application/json")
-
-	// Send the request
-	client := &http.Client{}
-	resp, err := client.Do(req)
-	if err != nil {
-		return nil, fmt.Errorf("failed to get AI decision: %v", err)
-	}
-	defer resp.Body.Close()
-
-	// Read the response body
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, fmt.Errorf("failed to read response: %v", err)
-	}
-
-	// Parse the Ollama response
-	var ollamaResponse struct {
-		Response string `json:"response"`
-	}
-	if err := json.Unmarshal(body, &ollamaResponse); err != nil {
-		return nil, fmt.Errorf("failed to parse Ollama response: %v", err)
-	}
-
-	// Clean the response to ensure it's valid JSON
-	cleanResponse := ollamaResponse.Response
-	// Remove any markdown code block markers if present
-	cleanResponse = strings.TrimPrefix(cleanResponse, "```json")
-	cleanResponse = strings.TrimPrefix(cleanResponse, "```")
-	cleanResponse = strings.TrimSuffix(cleanResponse, "```")
-	cleanResponse = strings.TrimSpace(cleanResponse)
-
-	// Parse the AI's decision from the response
 	var decision CombatDecision
-	if err := json.Unmarshal([]byte(cleanResponse), &decision); err != nil {
-		return nil, fmt.Errorf("failed to parse AI decision: %v (response: %s)", err, cleanResponse)
+	if err := d.callOllama(ctx, prompt, &decision); err != nil {
+		return nil, err
 	}
 
 	d.logger.Info(fmt.Sprintf("AI Decision: %s (Confidence: %.2f) - %s",
@@ -177,64 +199,9 @@ Do not include any text before or after the JSON object.`,
 		currentLoc.X, currentLoc.Y, currentLoc.Z,
 		healthStatus)
 
-	// Prepare the request body for Ollama
-	requestBody := map[string]interface{}{
-		"model": "llama3.2",
-		"prompt": prompt,
-		"stream": false,
-		"format": "json",
-	}
-
-	jsonData, err := json.Marshal(requestBody)
-	if err != nil {
-		return false, fmt.Errorf("failed to marshal request: %v", err)
-	}
-
-	// Create the request
-	req, err := http.NewRequestWithContext(ctx, "POST", d.baseURL+"/api/generate", bytes.NewBuffer(jsonData))
-	if err != nil {
-		return false, fmt.Errorf("failed to create request: %v", err)
-	}
-	req.Header.Set("Content-Type", "application/json")
-
-	// Send the request
-	client := &http.Client{}
-	resp, err := client.Do(req)
-	if err != nil {
-		return false, fmt.Errorf("failed to get AI decision: %v", err)
-	}
-	defer resp.Body.Close()
-
-	// Read the response body
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return false, fmt.Errorf("failed to read response: %v", err)
-	}
-
-	// Parse the Ollama response
-	var ollamaResponse struct {
-		Response string `json:"response"`
-	}
-	if err := json.Unmarshal(body, &ollamaResponse); err != nil {
-		return false, fmt.Errorf("failed to parse Ollama response: %v", err)
-	}
-
-	// Clean the response to ensure it's valid JSON
-	cleanResponse := ollamaResponse.Response
-	// Remove any markdown code block markers if present
-	cleanResponse = strings.TrimPrefix(cleanResponse, "```json")
-	cleanResponse = strings.TrimPrefix(cleanResponse, "```")
-	cleanResponse = strings.TrimSuffix(cleanResponse, "```")
-	cleanResponse = strings.TrimSpace(cleanResponse)
-
-	var decision struct {
-		ShouldEngage bool    `json:"should_engage"`
-		Confidence   float64 `json:"confidence"`
-		Explanation  string  `json:"explanation"`
-	}
-
-	if err := json.Unmarshal([]byte(cleanResponse), &decision); err != nil {
-		return false, fmt.Errorf("failed to parse AI decision: %v (response: %s)", err, cleanResponse)
+	var decision EngagementDecision
+	if err := d.callOllama(ctx, prompt, &decision); err != nil {
+		return false, err
 	}
 
 	d.logger.Info(fmt.Sprintf("AI Engagement Decision: %v (Confidence: %.2f) - %s",
